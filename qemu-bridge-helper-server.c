@@ -1,13 +1,14 @@
 /*
- * SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+ * SPDX-License-Identifier: GPL-2.0-or-later
  * SPDX-CopyrightText: 2026 Skye Soss
  */
 
 /*
  * The privileged half of the qemu-bridge-helper replacement. It's socket
- * activated (Accept=yes, one process per connection) with CAP_NET_ADMIN,
- * checks the request against the same ACL file as upstream, creates and
- * configures the tap device, and sends its fd back to the client.
+ * activated (Accept=yes, one process per connection) with CAP_NET_ADMIN and
+ * serves the website.soss.QemuBridgeHelper Varlink interface on that
+ * connection. CreateTap() checks the bridge against the same ACL file as
+ * upstream, creates and configures the tap device, and returns its fd.
  */
 #define _GNU_SOURCE
 #include <sys/ioctl.h>
@@ -20,14 +21,16 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdarg.h>
-#include <inttypes.h>
-#include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 
 #include <systemd/sd-daemon.h>
+#include <systemd/sd-json.h>
+#include <systemd/sd-varlink.h>
+#include <systemd/sd-varlink-idl.h>
 
 #include "qemu-bridge-helper.h"
 
@@ -160,37 +163,67 @@ err:
 }
 /* SPDX-SnippetEnd */
 
-static void prep_ifreq(struct ifreq *ifr, const char *ifname) {
-    memset(ifr, 0, sizeof(*ifr));
-    snprintf(ifr->ifr_name, IFNAMSIZ, "%s", ifname);
-}
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 
-/* Records why a request failed in the reply and returns -err */
-__attribute__((format(printf, 3, 4)))
-static int fail(struct reply *reply, int err, const char *fmt, ...) {
+static SD_VARLINK_DEFINE_METHOD(
+        CreateTap,
+        SD_VARLINK_FIELD_COMMENT("The bridge to add the tap device to. It must be allowed by " ACL_FILE "."),
+        SD_VARLINK_DEFINE_INPUT(bridge, SD_VARLINK_STRING, 0),
+        SD_VARLINK_FIELD_COMMENT("Whether to enable virtio-net headers (IFF_VNET_HDR). Defaults to false."),
+        SD_VARLINK_DEFINE_INPUT(vnetHeader, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE),
+        SD_VARLINK_FIELD_COMMENT("The name of the tap device."),
+        SD_VARLINK_DEFINE_OUTPUT(interfaceName, SD_VARLINK_STRING, 0),
+        SD_VARLINK_FIELD_COMMENT("Index of the tap device's file descriptor among the fds sent with the reply. The device goes away once every copy of it is closed."),
+        SD_VARLINK_DEFINE_OUTPUT(fileDescriptor, SD_VARLINK_INT, 0));
+
+static SD_VARLINK_DEFINE_ERROR(
+        BridgeNotAllowed,
+        SD_VARLINK_DEFINE_FIELD(bridge, SD_VARLINK_STRING, 0));
+
+static SD_VARLINK_DEFINE_ERROR(
+        NoSuchBridge,
+        SD_VARLINK_DEFINE_FIELD(bridge, SD_VARLINK_STRING, 0));
+
+static SD_VARLINK_DEFINE_INTERFACE(
+        website_soss_QemuBridgeHelper,
+        INTERFACE_NAME,
+        SD_VARLINK_INTERFACE_COMMENT("Creates tap devices on bridges for unprivileged qemu, as qemu-bridge-helper does."),
+        SD_VARLINK_SYMBOL_COMMENT("Creates a tap device, adds it to a bridge, and brings it up."),
+        &vl_method_CreateTap,
+        SD_VARLINK_SYMBOL_COMMENT("The ACL file doesn't allow the bridge."),
+        &vl_error_BridgeNotAllowed,
+        SD_VARLINK_SYMBOL_COMMENT("No network interface with the bridge's name exists."),
+        &vl_error_NoSuchBridge);
+
+#pragma GCC diagnostic pop
+
+/* Logs "<message>: <strerror(errno)>" and returns -errno */
+__attribute__((format(printf, 1, 2)))
+static int log_errno(const char *fmt, ...) {
+    int err = errno;
     va_list ap;
 
+    fputs(SD_WARNING, stderr);
     va_start(ap, fmt);
-    vsnprintf(reply->message, sizeof reply->message, fmt, ap);
+    vfprintf(stderr, fmt, ap);
     va_end(ap);
+    fprintf(stderr, ": %s\n", strerror(err));
     return -err;
 }
 
-static int check_acl(const char *bridge, struct reply *reply) {
+static int check_acl(const char *bridge) {
     ACLList acl_list;
     ACLRule *acl_rule;
     bool allowed = false, denied = false;
     int r = 0;
 
-    /* Re-read on every request, so edits apply without a restart */
     STAILQ_INIT(&acl_list);
     if (parse_acl_file(ACL_FILE, &acl_list) < 0) {
-        r = fail(reply, errno, "failed to parse acl file `%s': %s",
-                 ACL_FILE, strerror(errno));
+        r = log_errno("failed to parse acl file `%s'", ACL_FILE);
         goto cleanup;
     }
 
-    /* Default policy is deny, and deny always wins over allow */
     STAILQ_FOREACH(acl_rule, &acl_list, entry) {
         switch (acl_rule->type) {
             case ACL_ALLOW_ALL:
@@ -210,8 +243,10 @@ static int check_acl(const char *bridge, struct reply *reply) {
         }
     }
 
-    if (!allowed || denied)
-        r = fail(reply, EACCES, "access to bridge `%s' denied by acl file", bridge);
+    if (!allowed || denied) {
+        fprintf(stderr, SD_WARNING "access to bridge `%s' denied by acl file\n", bridge);
+        r = -EACCES;
+    }
 
 cleanup:
     while ((acl_rule = STAILQ_FIRST(&acl_list)) != NULL) {
@@ -221,195 +256,155 @@ cleanup:
     return r;
 }
 
-/* Creates a tap device on the bridge and returns its fd. The tap isn't
- * persistent, so it goes away once every copy of the fd is closed. */
-static int create_tap(const char *bridge, bool use_vnet, uid_t owner,
-                      struct reply *reply) {
+/* Creates a tap device on the bridge and returns its fd. */
+static int create_tap(const char *bridge, bool use_vnet, char iface[IFNAMSIZ]) {
     _cleanup_close_ int ctlfd = -EBADF;
     _cleanup_close_ int fd = -EBADF;
-    char *iface = reply->ifname;
-    struct ifreq ifr;
-    int ifindex;
-    int mtu;
+    struct ifreq tap = {
+        .ifr_name = "tap%d",
+        .ifr_flags = IFF_TAP | IFF_NO_PI | (use_vnet ? IFF_VNET_HDR : 0),
+    };
+    struct ifreq br = { 0 };
+
+    snprintf(br.ifr_name, IFNAMSIZ, "%s", bridge);
 
     ctlfd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (ctlfd < 0)
-        return fail(reply, errno, "failed to open control socket: %s",
-                    strerror(errno));
+        return log_errno("failed to open control socket");
 
     fd = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
     if (fd < 0)
-        return fail(reply, errno, "failed to open /dev/net/tun: %s",
-                    strerror(errno));
+        return log_errno("failed to open /dev/net/tun");
 
-    /* Request a tap device, disable PI, and add vnet header support if
-     * requested and it's available */
-    prep_ifreq(&ifr, "tap%d");
-    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
-    if (use_vnet) {
-        unsigned features = 0;
-        if (ioctl(fd, TUNGETFEATURES, &features) >= 0
-                && (features & IFF_VNET_HDR)) {
-            ifr.ifr_flags |= IFF_VNET_HDR;
-        }
-    }
+    if (ioctl(fd, TUNSETIFF, &tap) < 0)
+        return log_errno("failed to create tap device");
 
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0)
-        return fail(reply, errno, "failed to create tun device: %s",
-                    strerror(errno));
-
-    snprintf(iface, IFNAMSIZ, "%s", ifr.ifr_name);
-
-    /* Record who asked for it, so it shows up in "ip -d link" */
-    if (ioctl(fd, TUNSETOWNER, (unsigned long)owner) < 0)
-        return fail(reply, errno, "failed to set owner of device `%s': %s",
-                    iface, strerror(errno));
+    snprintf(iface, IFNAMSIZ, "%s", tap.ifr_name);
 
     /* Set the MTU of the interface based on the bridge */
-    prep_ifreq(&ifr, bridge);
-    if (ioctl(ctlfd, SIOCGIFMTU, &ifr) < 0)
-        return fail(reply, errno, "failed to get mtu of bridge `%s': %s",
-                    bridge, strerror(errno));
+    if (ioctl(ctlfd, SIOCGIFMTU, &br) < 0)
+        return log_errno("failed to get mtu of bridge `%s'", bridge);
 
-    mtu = ifr.ifr_mtu;
-
-    prep_ifreq(&ifr, iface);
-    ifr.ifr_mtu = mtu;
-    if (ioctl(ctlfd, SIOCSIFMTU, &ifr) < 0)
-        return fail(reply, errno, "failed to set mtu of device `%s' to %d: %s",
-                    iface, mtu, strerror(errno));
+    tap.ifr_mtu = br.ifr_mtu;
+    if (ioctl(ctlfd, SIOCSIFMTU, &tap) < 0)
+        return log_errno("failed to set mtu of device `%s' to %d", iface, tap.ifr_mtu);
 
     /* Linux uses the lowest enslaved MAC address as the MAC address of the
      * bridge. Set the MAC address to a high value so that it doesn't affect
      * the MAC address of the bridge. */
-    prep_ifreq(&ifr, iface);
-    if (ioctl(ctlfd, SIOCGIFHWADDR, &ifr) < 0)
-        return fail(reply, errno, "failed to get MAC address of device `%s': %s",
-                    iface, strerror(errno));
+    if (ioctl(ctlfd, SIOCGIFHWADDR, &tap) < 0)
+        return log_errno("failed to get MAC address of device `%s'", iface);
 
-    ifr.ifr_hwaddr.sa_data[0] = (char)0xFE;
-    if (ioctl(ctlfd, SIOCSIFHWADDR, &ifr) < 0)
-        return fail(reply, errno, "failed to set MAC address of device `%s': %s",
-                    iface, strerror(errno));
+    tap.ifr_hwaddr.sa_data[0] = (char)0xFE;
+    if (ioctl(ctlfd, SIOCSIFHWADDR, &tap) < 0)
+        return log_errno("failed to set MAC address of device `%s'", iface);
 
     /* Add the interface to the bridge */
-    ifindex = if_nametoindex(iface);
-    if (ifindex == 0)
-        return fail(reply, errno, "failed to get index of device `%s': %s",
-                    iface, strerror(errno));
+    if (ioctl(ctlfd, SIOCGIFINDEX, &tap) < 0)
+        return log_errno("failed to get index of device `%s'", iface);
 
-    prep_ifreq(&ifr, bridge);
-    ifr.ifr_ifindex = ifindex;
-    if (ioctl(ctlfd, SIOCBRADDIF, &ifr) < 0)
-        return fail(reply, errno, "failed to add interface `%s' to bridge `%s': %s",
-                    iface, bridge, strerror(errno));
+    br.ifr_ifindex = tap.ifr_ifindex;
+    if (ioctl(ctlfd, SIOCBRADDIF, &br) < 0)
+        return log_errno("failed to add interface `%s' to bridge `%s'", iface, bridge);
 
     /* Bring the interface up */
-    prep_ifreq(&ifr, iface);
-    if (ioctl(ctlfd, SIOCGIFFLAGS, &ifr) < 0)
-        return fail(reply, errno, "failed to get interface flags for `%s': %s",
-                    iface, strerror(errno));
+    if (ioctl(ctlfd, SIOCGIFFLAGS, &tap) < 0)
+        return log_errno("failed to get interface flags for `%s'", iface);
 
-    ifr.ifr_flags |= IFF_UP;
-    if (ioctl(ctlfd, SIOCSIFFLAGS, &ifr) < 0)
-        return fail(reply, errno, "failed to bring up interface `%s': %s",
-                    iface, strerror(errno));
+    tap.ifr_flags |= IFF_UP;
+    if (ioctl(ctlfd, SIOCSIFFLAGS, &tap) < 0)
+        return log_errno("failed to bring up interface `%s'", iface);
 
     return TAKE_FD(fd);
 }
 
-/* Reads and validates a request, and returns the tap fd for it */
-static int handle_request(int c, const struct ucred *peer,
-                          struct request *request, struct reply *reply) {
-    ssize_t n;
-    int r;
+typedef struct CreateTapParameters {
+    const char *bridge;
+    bool vnet_header;
+} CreateTapParameters;
 
-    /* MSG_TRUNC makes recv() return the real packet size, so oversized
-     * packets are caught too. Any fds the client attached are discarded,
-     * since no control buffer is given. */
-    n = recv(c, request, sizeof *request, MSG_TRUNC);
-    if (n < 0)
-        return fail(reply, errno, "failed to read request: %s", strerror(errno));
-    if ((size_t)n != sizeof *request || request->magic != PROTO_MAGIC)
-        return fail(reply, EBADMSG, "malformed request");
-    if (request->flags & ~REQUEST_USE_VNET)
-        return fail(reply, EINVAL, "unknown request flags 0x%" PRIx32,
-                    request->flags);
-    if (memchr(request->bridge, 0, IFNAMSIZ) == NULL || request->bridge[0] == 0)
-        return fail(reply, EINVAL, "invalid bridge name");
+/* Errors returned as negative errnos are sent as io.systemd.System errors */
+static int vl_method_create_tap(sd_varlink *link, sd_json_variant *parameters,
+                                sd_varlink_method_flags_t flags, void *userdata) {
+    static const sd_json_dispatch_field dispatch_table[] = {
+        { "bridge",     SD_JSON_VARIANT_STRING,  sd_json_dispatch_const_string, offsetof(CreateTapParameters, bridge),      SD_JSON_MANDATORY },
+        { "vnetHeader", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,      offsetof(CreateTapParameters, vnet_header), 0                 },
+        { NULL }
+    };
+    _cleanup_close_ int fd = -EBADF;
+    CreateTapParameters p = { 0 };
+    char iface[IFNAMSIZ];
+    uid_t uid;
+    int idx, r;
+    (void)flags;
+    (void)userdata;
 
-    r = check_acl(request->bridge, reply);
+    r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
+    if (r != 0)
+        return r;
+
+    if (p.bridge[0] == 0 || strlen(p.bridge) >= IFNAMSIZ)
+        return sd_varlink_error_invalid_parameter_name(link, "bridge");
+
+    r = sd_varlink_get_peer_uid(link, &uid);
     if (r < 0)
         return r;
 
-    return create_tap(request->bridge, request->flags & REQUEST_USE_VNET,
-                      peer->uid, reply);
-}
+    fprintf(stderr, SD_INFO "uid %u requested a tap device on bridge %s\n",
+            (unsigned)uid, p.bridge);
 
-static int serve(int c) {
-    _cleanup_close_ int tapfd = -EBADF;
-    struct request request = { 0 };
-    struct reply reply = { .magic = PROTO_MAGIC };
-    struct ucred peer;
-    socklen_t len = sizeof peer;
-    int r;
+    r = check_acl(p.bridge);
+    if (r == -EACCES)
+        return sd_varlink_errorbo(link, ERROR_BRIDGE_NOT_ALLOWED,
+                                  SD_JSON_BUILD_PAIR_STRING("bridge", p.bridge));
+    if (r < 0)
+        return r;
 
-    r = sd_is_socket_unix(c, SOCK_SEQPACKET, /* listening= */ 0, NULL, 0);
-    if (r < 0) {
-        fprintf(stderr, SD_ERR "failed to check socket: %s\n", strerror(-r));
-        return EXIT_FAILURE;
-    }
-    if (r == 0) {
-        fprintf(stderr, SD_ERR "expected a connected AF_UNIX SOCK_SEQPACKET "
-                "socket, is the socket unit missing Accept=yes?\n");
-        return EXIT_FAILURE;
+    if (if_nametoindex(p.bridge) == 0) {
+        fprintf(stderr, SD_WARNING "bridge `%s' does not exist\n", p.bridge);
+        return sd_varlink_errorbo(link, ERROR_NO_SUCH_BRIDGE,
+                                  SD_JSON_BUILD_PAIR_STRING("bridge", p.bridge));
     }
 
-    if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &peer, &len) < 0) {
-        fprintf(stderr, SD_ERR "failed to get peer credentials: %s\n",
-                strerror(errno));
-        return EXIT_FAILURE;
-    }
+    fd = create_tap(p.bridge, p.vnet_header, iface);
+    if (fd < 0)
+        return fd;
 
-    r = set_timeout(c);
-    if (r < 0) {
-        fprintf(stderr, SD_ERR "failed to set socket timeout: %s\n", strerror(-r));
-        return EXIT_FAILURE;
-    }
+    idx = sd_varlink_push_fd(link, fd);
+    if (idx < 0)
+        return idx;
+    TAKE_FD(fd);
 
-    tapfd = handle_request(c, &peer, &request, &reply);
-    if (tapfd < 0) {
-        reply.error = -tapfd;
-        fprintf(stderr, SD_WARNING "uid %u pid %d: %s\n",
-                (unsigned)peer.uid, (int)peer.pid, reply.message);
-    } else {
-        fprintf(stderr, SD_INFO "uid %u pid %d: added %s to bridge %s\n",
-                (unsigned)peer.uid, (int)peer.pid, reply.ifname, request.bridge);
-    }
+    fprintf(stderr, SD_INFO "added %s to bridge %s\n", iface, p.bridge);
 
-    r = send_packet(c, &reply, sizeof reply, tapfd);
-    if (r < 0) {
-        fprintf(stderr, SD_ERR "uid %u pid %d: failed to send reply: %s\n",
-                (unsigned)peer.uid, (int)peer.pid, strerror(-r));
-        return EXIT_FAILURE;
-    }
-
-    return tapfd < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+    return sd_varlink_replybo(link,
+                              SD_JSON_BUILD_PAIR_STRING("interfaceName", iface),
+                              SD_JSON_BUILD_PAIR_INTEGER("fileDescriptor", idx));
 }
 
 int main(void) {
-    int n;
+    _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
+    int r;
 
-    n = sd_listen_fds(/* unset_environment= */ 1);
-    if (n < 0) {
-        fprintf(stderr, SD_ERR "failed to get passed fds: %s\n", strerror(-n));
-        return EXIT_FAILURE;
-    }
-    if (n != 1) {
-        fprintf(stderr, SD_ERR "expected one connection passed by socket "
-                "activation (Accept=yes), got %d fds\n", n);
+    r = sd_varlink_invocation(SD_VARLINK_ALLOW_ACCEPT);
+    if (r <= 0) {
+        fprintf(stderr, SD_ERR "must be socket activated with Accept=yes and "
+                "FileDescriptorName=varlink%s%s\n",
+                r < 0 ? ": " : "", r < 0 ? strerror(-r) : "");
         return EXIT_FAILURE;
     }
 
-    return serve(SD_LISTEN_FDS_START);
+    r = sd_varlink_server_new(&server, SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT);
+    if (r >= 0)
+        r = sd_varlink_server_add_interface(server, &vl_interface_website_soss_QemuBridgeHelper);
+    if (r >= 0)
+        r = sd_varlink_server_bind_method(server, METHOD_CREATE_TAP, vl_method_create_tap);
+    if (r >= 0)
+        r = sd_varlink_server_loop_auto(server);
+    if (r < 0) {
+        fprintf(stderr, SD_ERR "failed to run varlink server: %s\n", strerror(-r));
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
 }

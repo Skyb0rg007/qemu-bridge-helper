@@ -1,12 +1,15 @@
+# SPDX-License-Identifier: MIT-0
+# SPDX-FileCopyrightText: 2026 Skye Soss
 [Unit]
 Description=QEMU bridge helper socket
 
 [Socket]
-ListenSequentialPacket=/run/qemu-bridge-helper.sock
-# Anyone may ask, like the setuid helper; /etc/qemu/bridge.conf decides what
-# they get. Use SocketMode=0660 and SocketGroup= to narrow it down.
+ListenStream=/run/qemu-bridge-helper/qemu-bridge-helper.sock
+Symlinks=/run/varlink/registry/website.soss.QemuBridgeHelper
 SocketMode=0666
+FileDescriptorName=varlink
 Accept=yes
+MaxConnectionsPerSource=16
 
 [Install]
 WantedBy=sockets.target
