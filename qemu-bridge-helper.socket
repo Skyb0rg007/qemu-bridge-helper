@@ -1,0 +1,12 @@
+[Unit]
+Description=QEMU bridge helper socket
+
+[Socket]
+ListenSequentialPacket=/run/qemu-bridge-helper.sock
+# Anyone may ask, like the setuid helper; /etc/qemu/bridge.conf decides what
+# they get. Use SocketMode=0660 and SocketGroup= to narrow it down.
+SocketMode=0666
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
