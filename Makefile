@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT-0
+# SPDX-FileCopyrightText: 2026 Skye Soss
 CC = cc
 CFLAGS = -Wall -Wextra -std=c99 -pedantic
 LDFLAGS =

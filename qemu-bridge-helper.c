@@ -1,14 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
- * SPDX-CopyrightText: 2026 Skye Soss
- */
-
-/*
- * The unprivileged half of the qemu-bridge-helper replacement, and what qemu
- * runs as its bridge helper
- * ("qemu-bridge-helper [--use-vnet] --br=bridge --fd=unixfd"). It calls
- * CreateTap() on qemu-bridge-helper-server over Varlink, and passes the tap
- * fd it gets back on to qemu.
+ * SPDX-FileCopyrightText: 2026 Skye Soss
  */
 #define _GNU_SOURCE
 #include <sys/socket.h>

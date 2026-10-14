@@ -4,6 +4,7 @@
 pkgs.mkShell {
   nativeBuildInputs = [
     pkgs.pkg-config
+    pkgs.reuse
   ];
   buildInputs = [
     pkgs.systemdLibs
