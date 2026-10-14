@@ -32,8 +32,15 @@ static void closep(int *fd) {
         *_pvar_ = -EBADF; \
         _var_; })
 
+static void *xmalloc(size_t size) {
+    void *p = malloc(size);
+    if (p == NULL)
+        abort();
+    return p;
+}
+
 /* QEMU uses glib and their own version of queue.h */
-#define g_malloc(N) malloc(N)
+#define g_malloc(N) xmalloc(N)
 #define g_ascii_isspace(C) (strchr(" \r\t\n\v", (C)) != NULL)
 #define g_str_equal(S1, S2) (strcmp((S1), (S2)) == 0)
 #define QSIMPLEQ_ENTRY(T) STAILQ_ENTRY(T)
