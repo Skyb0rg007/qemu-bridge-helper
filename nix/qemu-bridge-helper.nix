@@ -22,5 +22,7 @@ pkgs.stdenv.mkDerivation {
     description = "Implementation of qemu-bridge-helper without setuid";
     homepage = "https://github.com/Skyb0rg007/qemu-bridge-helper";
     license = lib.licenses.gpl2Plus;
+    platforms = lib.platforms.linux;
+    mainProgram = "qemu-bridge-helper";
   };
 }

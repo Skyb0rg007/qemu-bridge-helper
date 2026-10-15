@@ -5,4 +5,8 @@
 }:
 {
   qemu-bridge-helper = pkgs.callPackage ./nix/qemu-bridge-helper.nix { };
+
+  nixosModules.default = ./nix/nixos-module.nix;
+
+  tests.nixos = pkgs.testers.runNixOSTest ./nix/nixos-test.nix;
 }
