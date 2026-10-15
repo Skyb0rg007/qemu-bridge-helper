@@ -4,7 +4,7 @@
 Description=QEMU bridge helper (connection %i)
 
 [Service]
-ExecStart=/usr/local/libexec/qemu-bridge-helper-server
+ExecStart=@libexecdir@/qemu-bridge-helper-server
 DynamicUser=yes
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN

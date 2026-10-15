@@ -2,3 +2,6 @@
 # SPDX-FileCopyrightText: 2026 Skye Soss
 /qemu-bridge-helper
 /qemu-bridge-helper-server
+*.o
+result
+result-*
